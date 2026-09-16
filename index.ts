@@ -1,38 +1,47 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
-// Best-effort guard for Responses-style reasoning continuation failures on
-// OpenCode V1:
+// rs-guard-v1: best-effort guard for Responses-style reasoning continuation
+// failures on OpenCode V1 (`@opencode-ai/plugin`).
 //
+// Errors handled:
 // - `reasoning encrypted_content was not issued to this caller`
 // - `invalid_encrypted_content` / `could not be verified`
 // - `Referenced reasoning item 'rs_..:rs_..' was not found or has expired`
 //
 // Seen on Gateway Console free models (e.g. muse-spark-1.3-contributor-free
 // failing on message 2-3 of a fresh session) and on Responses API with
-// `store: false` after a few tool turns.
+// `store: false` after a few tool turns. Same family as upstream
+// anomalyco/opencode PR #28678 (don't replay `rs_*` ids when stateless) and
+// PR #29000 (summary splitting, encrypted replay, `item_reference` when stored).
 //
-// V1 has no V2-style request/retry hooks, so this is best-effort only:
-// 1. `chat.params`: strip `include: reasoning.encrypted_content`, drop
-//    `previous_response_id` / `conversation` continuation fields, force
-//    `store: false` on the outgoing provider options.
+// How it works — best-effort only (V1 exposes no request/retry hooks):
+// 1. `chat.params`: force stateless provider options (drop
+//    `previous_response_id` / `conversation`, force `store: false`), drop
+//    `include: reasoning.encrypted_content`.
 // 2. `experimental.chat.messages.transform`: strip server-issued ids from
-//    every part and keep at most 1 newest encrypted blob, so lowering can't
-//    build an `item_reference` to expired items.
-// 3. `experimental.session.compacting`: ask the summarizer not to carry
-//    provider reasoning blobs / ids into the compacted session.
-// 4. `event` (`session.error`): surface a toast telling the user to retry
-//    or start a fresh session.
+//    every part, keep at most 1 newest encrypted blob.
+// 3. `experimental.session.compacting`: keep provider reasoning blobs/ids
+//    out of the compacted session.
+// 4. `event` (`session.error`): toast guidance on a matching error — retry,
+//    or start a fresh session if it persists.
 //
-// For the full self-heal (stateless replay + retry without reasoning) use
-// OpenCode V2 with `github:arfoux/rs-guard`.
+// Invariant: server-issued continuation ids live in metadata keys only; the
+// local `id` of a part is never touched, so tool-call/tool-result pairing
+// stays intact.
+//
+// For the full self-heal (stateless replay + automatic retry without
+// reasoning) use OpenCode V2 with `github:arfoux/rs-guard`.
 
+// Matches the reasoning-continuation error class (case-insensitive).
 const CONTINUATION_ERROR_PATTERN =
   /encrypted_content|invalid_encrypted_content|was not issued to this caller|could not be verified|was not found or has expired|referenced reasoning|reasoning item|previous_response|previous response|item_reference/i
 
+// Server-issued ids look like `rs_…`, `msg_…`, `resp_…` — a `prefix_payload`
+// shape plain local ids never match.
 const SERVER_ITEM_ID_PATTERN = /^[A-Za-z]+_[A-Za-z0-9][A-Za-z0-9:_-]*$/
 
-// Server-issued continuation ids live in metadata keys only — never touch the
-// local `id` of a part, so tool-call/tool-result pairing stays intact.
+// Metadata keys carrying server-issued continuation ids (local `id` is
+// never touched — see invariant above).
 const SERVER_ID_KEYS: Record<string, true> = {
   itemid: true,
   item_id: true,
@@ -42,10 +51,13 @@ const SERVER_ID_KEYS: Record<string, true> = {
   responseid: true,
 }
 
+// Type guard for the `prefix_payload` shape above.
 function isServerItemId(value: unknown): value is string {
   return typeof value === "string" && SERVER_ITEM_ID_PATTERN.test(value)
 }
 
+// Metadata containers that may carry continuation state, including
+// one-level-deeper provider nests.
 function metadataContainers(obj: object): object[] {
   const containers: object[] = []
   for (const [k, v] of Object.entries(obj)) {
@@ -62,8 +74,8 @@ function metadataContainers(obj: object): object[] {
   return containers
 }
 
-// Remove ONLY server ids (leave encrypted blobs alone) — used on the normal
-// path so lowering can't build an expired `item_reference`.
+// Normal path: remove ONLY server ids (leave encrypted blobs alone) so
+// lowering can't build an expired `item_reference`.
 function stripServerIdsOnly(obj: object): boolean {
   let stripped = false
   for (const c of metadataContainers(obj)) {
@@ -77,7 +89,7 @@ function stripServerIdsOnly(obj: object): boolean {
   return stripped
 }
 
-// Remove encrypted blobs AND server ids from one part/message object.
+// Self-heal path: remove encrypted blobs AND server ids from one part/message.
 function stripEncryptedKeys(obj: object): boolean {
   let stripped = false
   for (const c of [obj, ...metadataContainers(obj)]) {
@@ -102,6 +114,7 @@ function stripEncryptedKeys(obj: object): boolean {
   return stripped
 }
 
+// True if any nested key containing `encrypt` holds a non-empty string blob.
 function hasEncrypted(obj: object): boolean {
   const seen = new Set<object>()
   const stack: object[] = [obj]
@@ -117,6 +130,8 @@ function hasEncrypted(obj: object): boolean {
   return false
 }
 
+// Drop `include: reasoning.encrypted_content`, including provider-scoped nests
+// (e.g. `options.openai.include`).
 function stripInclude(options: object): void {
   for (const [k, v] of Object.entries(options)) {
     if (k === "include" && Array.isArray(v)) {
@@ -130,7 +145,7 @@ function stripInclude(options: object): void {
   }
 }
 
-// Force stateless full replay: no previous_response_id, no store.
+// Force stateless full replay: no continuation pointers, no store.
 function dropContinuation(options: object, depth = 0): void {
   if (depth > 4) return
   for (const [k, v] of Object.entries(options)) {
@@ -153,6 +168,7 @@ function dropContinuation(options: object, depth = 0): void {
   }
 }
 
+// One toast per session per 30s — errors still surface, we just don't nag.
 const TOAST_THROTTLE_MS = 30_000
 
 // NOTE: exactly one export — the V1 loader calls every exported function
@@ -172,6 +188,7 @@ export const RsGuardV1: Plugin = async ({ client }) => {
 
     "experimental.chat.messages.transform": async (_input, output) => {
       try {
+        // Normal path: ALWAYS strip server ids; afterwards trim older blobs.
         const encryptedReasoning: object[] = []
         for (const m of output.messages) {
           for (const p of m.parts) {
@@ -209,6 +226,7 @@ export const RsGuardV1: Plugin = async ({ client }) => {
             detail = data.message
           }
         }
+        // Anything outside the continuation-error class passes through untouched.
         if (!CONTINUATION_ERROR_PATTERN.test(detail)) return
         const sessionID = event.properties.sessionID ?? ""
         const now = Date.now()
