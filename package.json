@@ -1,0 +1,37 @@
+{
+  "name": "opencode-rs-guard-v1",
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arfoux/rs-guard-v1.git"
+  },
+  "main": "index.ts",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.31"
+  },
+  "exports": {
+    ".": "./index.ts"
+  },
+  "bugs": {
+    "url": "https://github.com/arfoux/rs-guard-v1/issues"
+  },
+  "description": "Best-effort guard for Responses-style reasoning continuation failures on OpenCode V1 (expired rs_* ids, rejected encrypted_content)",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "index.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "homepage": "https://github.com/arfoux/rs-guard-v1#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "reasoning",
+    "responses-api",
+    "encrypted-content"
+  ],
+  "license": "MIT",
+  "type": "module"
+}
